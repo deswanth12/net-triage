@@ -128,7 +128,7 @@
         <div class="header-left">
           <h2 id="configHeading" class="section-title">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-              <circle cx="12" cy="12" r="3"></circle>
+              <circle cx="12" cy="3" r="3"></circle>
               <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
             </svg>
             Detection Threshold Settings
@@ -229,6 +229,24 @@
     <!-- Active Dashboard Section (shown after load) -->
     <div id="dashboardSection" class="dashboard-wrapper hidden">
 
+      <!-- Workbench Action Bar: Export Triage Report -->
+      <div class="workbench-action-bar">
+        <div class="workbench-title-area">
+          <span class="workbench-badge">Active Capture Workbench</span>
+          <span id="activeCaptureLabel" class="workbench-file-name">capture.csv</span>
+        </div>
+        <div class="workbench-actions">
+          <button id="exportReportBtn" class="btn btn-primary btn-sm" title="Generate and download offline Markdown incident report">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+              <polyline points="7 10 12 15 17 10"></polyline>
+              <line x1="12" y1="15" x2="12" y2="3"></line>
+            </svg>
+            <span>Export Triage Report (.md)</span>
+          </button>
+        </div>
+      </div>
+
       <!-- Executive Overview Metric Cards -->
       <section class="metrics-grid" aria-label="Network Overview Summary">
         <div class="metric-card">
@@ -266,6 +284,35 @@
         <strong>Score Breakdown:</strong>
         <span id="scoreFormulaText">No active investigative penalties</span>
       </div>
+
+      <!-- Traffic Activity Timeline Card (Pure SVG) -->
+      <section id="timelineCard" class="card timeline-card" aria-labelledby="timelineHeading">
+        <div class="card-header">
+          <div class="header-left">
+            <h3 id="timelineHeading" class="section-title">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                <circle cx="12" cy="12" r="10"></circle>
+                <polyline points="12 6 12 12 16 14"></polyline>
+              </svg>
+              Traffic Density Timeline
+            </h3>
+            <span id="timelineSpanBadge" class="badge badge-subtle">Capture Span</span>
+          </div>
+          <span class="card-subtitle">Distribution over capture time</span>
+        </div>
+
+        <p class="timeline-analytical-note">
+          <strong>Analytic Notice:</strong> Traffic density can provide useful investigative context, but a spike alone does not establish malicious activity.
+        </p>
+
+        <!-- SVG Timeline Display or Fallback Message -->
+        <div id="timelineContainer" class="timeline-svg-wrap">
+          <!-- Dynamically populated pure SVG histogram -->
+        </div>
+        <div id="timelineFallback" class="timeline-fallback hidden" role="status">
+          Traffic timeline unavailable because usable packet timestamps were not found.
+        </div>
+      </section>
 
       <!-- Triage Alerts Section -->
       <section class="card alerts-section" aria-labelledby="alertsHeading">
@@ -338,7 +385,7 @@
         <section class="card" aria-labelledby="sourceHeading">
           <div class="card-header">
             <h3 id="sourceHeading" class="section-title">Top 10 Source Hosts</h3>
-            <span class="card-subtitle">Ranked by transmitted packets</span>
+            <span class="card-subtitle">Click IP to view Host Dossier</span>
           </div>
           <div class="table-scroll">
             <table class="data-table" aria-label="Top Source Hosts">
@@ -361,7 +408,7 @@
         <section class="card" aria-labelledby="destHeading">
           <div class="card-header">
             <h3 id="destHeading" class="section-title">Top 10 Destination Hosts</h3>
-            <span class="card-subtitle">Ranked by received packets</span>
+            <span class="card-subtitle">Click IP to view Host Dossier</span>
           </div>
           <div class="table-scroll">
             <table class="data-table" aria-label="Top Destination Hosts">
@@ -411,7 +458,7 @@
             <h3 id="packetsHeading" class="section-title">Packet Log Preview</h3>
             <span id="filteredPacketCount" class="badge badge-subtle">Showing 0 packets</span>
           </div>
-          <span class="card-subtitle">First 100 matching packets</span>
+          <span class="card-subtitle">First 100 matching packets &bull; Click IP for dossier</span>
         </div>
         <div class="table-scroll">
           <table class="data-table packet-table" aria-label="Packet Log Preview">
@@ -436,6 +483,102 @@
     </div>
   </main>
 
+  <!-- Interactive Host Dossier Modal -->
+  <div id="hostDossierModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="dossierIpTitle">
+    <div class="modal-dialog dossier-dialog">
+      <div class="modal-header">
+        <div class="header-left">
+          <div class="modal-icon dossier-icon" aria-hidden="true">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="2" y="2" width="20" height="8" rx="2" ry="2"></rect>
+              <rect x="2" y="14" width="20" height="8" rx="2" ry="2"></rect>
+              <line x1="6" y1="6" x2="6.01" y2="6"></line>
+              <line x1="6" y1="18" x2="6.01" y2="18"></line>
+            </svg>
+          </div>
+          <div>
+            <div class="dossier-title-row">
+              <h2 id="dossierIpTitle" class="modal-title cell-mono">0.0.0.0</h2>
+              <span id="dossierCategoryBadge" class="badge badge-category">Private RFC 1918</span>
+            </div>
+            <p class="modal-sub">Local-first Host Intelligence Dossier &bull; Zero external lookups</p>
+          </div>
+        </div>
+        <button id="closeDossierBtn" class="btn-close" aria-label="Close Host Dossier">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+            <line x1="18" y1="6" x2="6" y2="18"></line>
+            <line x1="6" y1="6" x2="6" y2="18"></line>
+          </svg>
+        </button>
+      </div>
+
+      <div class="modal-body dossier-body">
+        <!-- Host Activity Overview Metrics -->
+        <section class="dossier-stats-grid">
+          <div class="dossier-stat-card">
+            <span class="dossier-stat-label">Total Traffic</span>
+            <span id="dossierTotalPkts" class="dossier-stat-val">0</span>
+            <span id="dossierAvgBytes" class="dossier-stat-sub">Avg Size: 0 B</span>
+          </div>
+          <div class="dossier-stat-card">
+            <span class="dossier-stat-label">Packets Transmitted</span>
+            <span id="dossierSentPkts" class="dossier-stat-val">0</span>
+            <span id="dossierUniqueDests" class="dossier-stat-sub">0 destinations</span>
+          </div>
+          <div class="dossier-stat-card">
+            <span class="dossier-stat-label">Packets Received</span>
+            <span id="dossierRecvPkts" class="dossier-stat-val">0</span>
+            <span id="dossierUniqueSources" class="dossier-stat-sub">0 sources</span>
+          </div>
+          <div class="dossier-stat-card">
+            <span class="dossier-stat-label">Primary Protocol</span>
+            <span id="dossierTopProto" class="dossier-stat-val">None</span>
+            <span id="dossierProtoCount" class="dossier-stat-sub">0 packets</span>
+          </div>
+        </section>
+
+        <!-- Communications Breakdown -->
+        <div class="dossier-comms-grid">
+          <!-- Top Contacted Destinations -->
+          <div class="dossier-block">
+            <h4>Top Contacted Destinations</h4>
+            <div id="dossierTopDestsList" class="dossier-list">
+              <!-- Populated dynamically -->
+            </div>
+          </div>
+
+          <!-- Top Senders to This Host -->
+          <div class="dossier-block">
+            <h4>Top Systems Contacting This Host</h4>
+            <div id="dossierTopSourcesList" class="dossier-list">
+              <!-- Populated dynamically -->
+            </div>
+          </div>
+        </div>
+
+        <!-- Protocol Distribution for Host -->
+        <div class="dossier-block">
+          <h4>Host Protocol Breakdown</h4>
+          <div id="dossierProtoBars" class="bars-container">
+            <!-- Populated dynamically -->
+          </div>
+        </div>
+
+        <!-- Associated Alerts for This Host -->
+        <div class="dossier-block">
+          <h4>Triggered Triage Findings Involving This Host</h4>
+          <div id="dossierAlertsList" class="dossier-alerts-container">
+            <!-- Populated dynamically -->
+          </div>
+        </div>
+      </div>
+
+      <div class="modal-footer">
+        <button id="closeDossierBottomBtn" class="btn btn-primary">Close Dossier</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Analyst Educational Guide Modal / Flyout -->
   <div id="analystGuideModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="guideTitle">
     <div class="modal-dialog">
@@ -452,7 +595,7 @@
         <button id="closeGuideBtn" class="btn-close" aria-label="Close Guide">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
             <line x1="18" y1="6" x2="6" y2="18"></line>
-            <line x1="6" y1="6" x2="18" y2="18"></line>
+            <line x1="6" y1="6" x2="6" y2="18"></line>
           </svg>
         </button>
       </div>

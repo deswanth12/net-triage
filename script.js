@@ -91,6 +91,7 @@ let currentThresholds = { ...DEFAULT_THRESHOLDS };
 let rawPackets = [];
 let currentFileName = '';
 let isDemoData = false;
+let latestRuleResults = { alerts: [], score: 0, breakdown: [] };
 
 // Active UI filters
 let activeFilter = {
@@ -109,6 +110,10 @@ const elements = {
   ingestStatus: document.getElementById('ingestStatus'),
   emptyState: document.getElementById('emptyState'),
   dashboardSection: document.getElementById('dashboardSection'),
+
+  // Workbench Actions
+  exportReportBtn: document.getElementById('exportReportBtn'),
+  activeCaptureLabel: document.getElementById('activeCaptureLabel'),
 
   // Demo Buttons
   loadNormalBtn: document.getElementById('loadNormalBtn'),
@@ -143,6 +148,12 @@ const elements = {
   scoreDetailsBox: document.getElementById('scoreDetailsBox'),
   scoreFormulaText: document.getElementById('scoreFormulaText'),
 
+  // Traffic Timeline
+  timelineCard: document.getElementById('timelineCard'),
+  timelineContainer: document.getElementById('timelineContainer'),
+  timelineFallback: document.getElementById('timelineFallback'),
+  timelineSpanBadge: document.getElementById('timelineSpanBadge'),
+
   // Alerts
   alertsContainer: document.getElementById('alertsContainer'),
   alertCountBadge: document.getElementById('alertCountBadge'),
@@ -161,6 +172,25 @@ const elements = {
   protocolFilter: document.getElementById('protocolFilter'),
   clearFiltersBtn: document.getElementById('clearFiltersBtn'),
 
+  // Host Dossier Modal
+  hostDossierModal: document.getElementById('hostDossierModal'),
+  dossierIpTitle: document.getElementById('dossierIpTitle'),
+  dossierCategoryBadge: document.getElementById('dossierCategoryBadge'),
+  dossierTotalPkts: document.getElementById('dossierTotalPkts'),
+  dossierAvgBytes: document.getElementById('dossierAvgBytes'),
+  dossierSentPkts: document.getElementById('dossierSentPkts'),
+  dossierUniqueDests: document.getElementById('dossierUniqueDests'),
+  dossierRecvPkts: document.getElementById('dossierRecvPkts'),
+  dossierUniqueSources: document.getElementById('dossierUniqueSources'),
+  dossierTopProto: document.getElementById('dossierTopProto'),
+  dossierProtoCount: document.getElementById('dossierProtoCount'),
+  dossierTopDestsList: document.getElementById('dossierTopDestsList'),
+  dossierTopSourcesList: document.getElementById('dossierTopSourcesList'),
+  dossierProtoBars: document.getElementById('dossierProtoBars'),
+  dossierAlertsList: document.getElementById('dossierAlertsList'),
+  closeDossierBtn: document.getElementById('closeDossierBtn'),
+  closeDossierBottomBtn: document.getElementById('closeDossierBottomBtn'),
+
   // Modal Guide
   toggleGuideBtn: document.getElementById('toggleGuideBtn'),
   analystGuideModal: document.getElementById('analystGuideModal'),
@@ -169,13 +199,71 @@ const elements = {
 };
 
 // ==========================================================================
-// Resilient RFC-4180 Client-Side CSV Parser
+// IP Address Classification Helper (100% Client-Side, Zero External Calls)
 // ==========================================================================
 
 /**
- * Parses raw CSV text handling quotes, embedded commas, and whitespace.
- * Prevents regex backtracking and memory exhaustion.
+ * Validates and classifies an IP address locally into standard network categories.
  */
+function classifyIpAddress(ip) {
+  if (!ip || typeof ip !== 'string') return 'Unknown';
+  const clean = ip.trim();
+
+  // IPv4 check
+  const v4Parts = clean.split('.');
+  if (v4Parts.length === 4 && v4Parts.every(part => /^\d+$/.test(part))) {
+    const [a, b, c, d] = v4Parts.map(n => parseInt(n, 10));
+    if ([a, b, c, d].every(n => n >= 0 && n <= 255)) {
+      // Loopback (127.0.0.0/8)
+      if (a === 127) return 'Loopback';
+
+      // Broadcast
+      if (a === 255 && b === 255 && c === 255 && d === 255) return 'Broadcast';
+      if (d === 255) return 'Broadcast';
+
+      // Link-local / APIPA (169.254.0.0/16)
+      if (a === 169 && b === 254) return 'Link-local';
+
+      // Multicast (224.0.0.0 to 239.255.255.255)
+      if (a >= 224 && a <= 239) return 'Multicast';
+
+      // Private RFC 1918
+      // 10.0.0.0/8
+      if (a === 10) return 'Private RFC 1918';
+      // 172.16.0.0/12
+      if (a === 172 && b >= 16 && b <= 31) return 'Private RFC 1918';
+      // 192.168.0.0/16
+      if (a === 192 && b === 168) return 'Private RFC 1918';
+
+      return 'Public/WAN';
+    }
+  }
+
+  // IPv6 check
+  if (clean.includes(':')) {
+    const lower = clean.toLowerCase();
+    if (lower === '::1' || lower === '0:0:0:0:0:0:0:1') return 'Loopback';
+    if (lower.startsWith('fe80:')) return 'Link-local';
+    if (lower.startsWith('fc') || lower.startsWith('fd')) return 'Private RFC 1918';
+    if (lower.startsWith('ff')) return 'Multicast';
+    return 'Public/WAN';
+  }
+
+  return 'Unknown';
+}
+
+/**
+ * Checks if a string looks like a valid IP address.
+ */
+function isValidIp(str) {
+  const cat = classifyIpAddress(str);
+  return cat !== 'Unknown';
+}
+
+// ==========================================================================
+// Resilient RFC-4180 Client-Side CSV Parser
+// ==========================================================================
+
 function parseCsvRows(csvText) {
   const rows = [];
   let currentRow = [];
@@ -222,9 +310,6 @@ function parseCsvRows(csvText) {
   return rows;
 }
 
-/**
- * Normalizes column header variations from Wireshark exports.
- */
 function mapColumnIndices(headerRow) {
   const mapping = {
     source: -1,
@@ -239,32 +324,19 @@ function mapColumnIndices(headerRow) {
   headerRow.forEach((col, index) => {
     const clean = col.trim().toLowerCase().replace(/[^a-z0-9._]/g, '');
 
-    // Source field variations
     if (['source', 'src', 'ip.src', 'sourceip', 'srcip', 'sourceaddress'].includes(clean)) {
       if (mapping.source === -1) mapping.source = index;
-    }
-    // Destination variations
-    else if (['destination', 'dst', 'dest', 'ip.dst', 'destinationip', 'dstip', 'destinationaddress'].includes(clean)) {
+    } else if (['destination', 'dst', 'dest', 'ip.dst', 'destinationip', 'dstip', 'destinationaddress'].includes(clean)) {
       if (mapping.destination === -1) mapping.destination = index;
-    }
-    // Protocol variations
-    else if (['protocol', 'proto', 'ip.proto'].includes(clean)) {
+    } else if (['protocol', 'proto', 'ip.proto'].includes(clean)) {
       if (mapping.protocol === -1) mapping.protocol = index;
-    }
-    // Length variations
-    else if (['length', 'len', 'frame.len', 'framelength', 'bytes', 'packetlength'].includes(clean)) {
+    } else if (['length', 'len', 'frame.len', 'framelength', 'bytes', 'packetlength'].includes(clean)) {
       if (mapping.length === -1) mapping.length = index;
-    }
-    // Info variations
-    else if (['info', 'information', 'summary', 'packetinfo'].includes(clean)) {
+    } else if (['info', 'information', 'summary', 'packetinfo'].includes(clean)) {
       if (mapping.info === -1) mapping.info = index;
-    }
-    // Time variations
-    else if (['time', 'timestamp', 'frame.time', 'time_relative'].includes(clean)) {
+    } else if (['time', 'timestamp', 'frame.time', 'time_relative'].includes(clean)) {
       if (mapping.time === -1) mapping.time = index;
-    }
-    // Packet number
-    else if (['no.', 'no', 'number', 'frame.number'].includes(clean)) {
+    } else if (['no.', 'no', 'number', 'frame.number'].includes(clean)) {
       if (mapping.number === -1) mapping.number = index;
     }
   });
@@ -272,9 +344,6 @@ function mapColumnIndices(headerRow) {
   return mapping;
 }
 
-/**
- * Parses and validates raw CSV content into sanitized packet objects.
- */
 function ingestCsvContent(csvString, fileName, isDemo = false) {
   currentFileName = fileName;
   isDemoData = isDemo;
@@ -309,6 +378,7 @@ function ingestCsvContent(csvString, fileName, isDemo = false) {
   if (colMap.protocol === -1) missingOptional.push('Protocol');
   if (colMap.length === -1) missingOptional.push('Length');
   if (colMap.info === -1) missingOptional.push('Info (port scan & SYN analysis rules disabled)');
+  if (colMap.time === -1) missingOptional.push('Time (traffic timeline disabled)');
 
   // Build sanitized packets
   const packets = [];
@@ -317,7 +387,7 @@ function ingestCsvContent(csvString, fileName, isDemo = false) {
     const source = (row[colMap.source] || '').trim();
     const destination = (row[colMap.destination] || '').trim();
 
-    if (!source && !destination) continue; // Skip completely blank lines
+    if (!source && !destination) continue;
 
     const packet = {
       no: colMap.number !== -1 && row[colMap.number] ? row[colMap.number].trim() : String(i),
@@ -350,14 +420,12 @@ function ingestCsvContent(csvString, fileName, isDemo = false) {
   showIngestStatus(statusType, statusMsg, isDemo);
   elements.emptyState.classList.add('hidden');
   elements.dashboardSection.classList.remove('hidden');
+  elements.activeCaptureLabel.textContent = `${fileName} (${packets.length} pkts)`;
 
   populateProtocolFilterDropdown();
   runAnalysisAndRender();
 }
 
-/**
- * Display ingestion status and error notifications safely.
- */
 function showIngestStatus(type, htmlMessage, isDemo = false) {
   elements.ingestStatus.className = `ingest-status ${type}`;
   elements.ingestStatus.classList.remove('hidden');
@@ -370,21 +438,15 @@ function showIngestStatus(type, htmlMessage, isDemo = false) {
 // Triage & Detection Rule Engine (Explainable, Rule-Based, Zero ML)
 // ==========================================================================
 
-/**
- * Helper to extract destination port from Wireshark Info column.
- * Matches patterns like "44101 -> 80 [SYN]", "Destination port: 53", "55432 > 8080"
- */
 function extractDestinationPort(infoStr) {
   if (!infoStr) return null;
 
-  // Arrow notation: "49152 -> 443" or "55432 > 8080"
   const arrowMatch = infoStr.match(/(?:->|>)\s*(\d+)/);
   if (arrowMatch) {
     const port = parseInt(arrowMatch[1], 10);
     if (port > 0 && port <= 65535) return port;
   }
 
-  // Explicit keyword: "Destination port: 53" or "Dst Port: 53"
   const explicitMatch = infoStr.match(/(?:destination\s*port|dst\s*port|dport)[:\s]+(\d+)/i);
   if (explicitMatch) {
     const port = parseInt(explicitMatch[1], 10);
@@ -394,22 +456,17 @@ function extractDestinationPort(infoStr) {
   return null;
 }
 
-/**
- * Runs the rule-based triage detection engine.
- * Generates transparent alerts and an explainable investigation score.
- */
 function evaluateDetectionRules(packets, thresholds) {
   const alerts = [];
   let investigationScore = 0;
   const scoreBreakdown = [];
 
-  // Aggregation maps
   const sourcePacketCounts = new Map();
-  const sourceDestMap = new Map();              // source -> Set(destinations)
-  const sourceDestPortsMap = new Map();         // `${source}->${dest}` -> Set(destPorts)
+  const sourceDestMap = new Map();
+  const sourceDestPortsMap = new Map();
   const sourceIcmpCounts = new Map();
   const sourceDnsCounts = new Map();
-  const conversationCounts = new Map();         // `${source}->${destination}` -> { count, protocols: Map() }
+  const conversationCounts = new Map();
   const sourceSynCounts = new Map();
 
   for (const pkt of packets) {
@@ -418,14 +475,11 @@ function evaluateDetectionRules(packets, thresholds) {
     const proto = pkt.protocol;
     const info = pkt.info;
 
-    // Packets per source
     sourcePacketCounts.set(src, (sourcePacketCounts.get(src) || 0) + 1);
 
-    // Unique destinations per source
     if (!sourceDestMap.has(src)) sourceDestMap.set(src, new Set());
     sourceDestMap.get(src).add(dst);
 
-    // Port scanning data
     const destPort = extractDestinationPort(info);
     if (destPort) {
       const srcDestKey = `${src}->${dst}`;
@@ -433,17 +487,14 @@ function evaluateDetectionRules(packets, thresholds) {
       sourceDestPortsMap.get(srcDestKey).add(destPort);
     }
 
-    // ICMP packets
     if (proto === 'ICMP' || proto.includes('ICMP')) {
       sourceIcmpCounts.set(src, (sourceIcmpCounts.get(src) || 0) + 1);
     }
 
-    // DNS packets
     if (proto === 'DNS' || proto.includes('DNS') || info.toLowerCase().includes('standard query')) {
       sourceDnsCounts.set(src, (sourceDnsCounts.get(src) || 0) + 1);
     }
 
-    // Source-to-Destination conversations
     const convKey = `${src} -> ${dst}`;
     if (!conversationCounts.has(convKey)) {
       conversationCounts.set(convKey, { count: 0, protocols: new Map() });
@@ -452,15 +503,12 @@ function evaluateDetectionRules(packets, thresholds) {
     conv.count++;
     conv.protocols.set(proto, (conv.protocols.get(proto) || 0) + 1);
 
-    // TCP SYN analysis
     if (proto === 'TCP' && info.includes('[SYN]') && !info.includes('[SYN, ACK]')) {
       sourceSynCounts.set(src, (sourceSynCounts.get(src) || 0) + 1);
     }
   }
 
-  // ------------------------------------------------------------------------
   // RULE 1 — HIGH PACKET VOLUME
-  // ------------------------------------------------------------------------
   sourcePacketCounts.forEach((count, source) => {
     if (count > thresholds.volume) {
       const sev = count > thresholds.volume * 2.5 ? 'MEDIUM' : 'LOW';
@@ -470,12 +518,15 @@ function evaluateDetectionRules(packets, thresholds) {
 
       alerts.push({
         id: `rule1-${source}`,
+        ruleId: 'RULE-1-HIGH-VOLUME',
         name: 'High Packet Volume',
         severity: sev,
         source: source,
-        destination: 'Various',
+        destination: null,
         activity: `${count} packets generated by host`,
+        evidence: `${count} packets transmitted (Threshold: ${thresholds.volume})`,
         threshold: `Threshold: > ${thresholds.volume} packets`,
+        explanation: 'A host generating significantly more traffic than expected may warrant investigation to determine if anomalous bulk transfer or automated processes are occurring.',
         whyMatters: 'A host generating significantly more traffic than expected may warrant investigation to determine if anomalous bulk transfer or automated processes are occurring.',
         benignExplanations: [
           'Legitimate file transfers or local network backups',
@@ -488,14 +539,13 @@ function evaluateDetectionRules(packets, thresholds) {
           'Review the destination addresses to verify whether they are expected services.',
           'Check whether the burst correlates with an authorized scheduled task.',
           'Review endpoint process logs (EDR/Task Manager) on the source host.'
-        ]
+        ],
+        wiresharkFilter: isValidIp(source) ? `ip.addr == ${source}` : null
       });
     }
   });
 
-  // ------------------------------------------------------------------------
   // RULE 2 — POSSIBLE HOST SCANNING
-  // ------------------------------------------------------------------------
   sourceDestMap.forEach((destSet, source) => {
     const uniqueDests = destSet.size;
     if (uniqueDests > thresholds.destinations) {
@@ -505,12 +555,15 @@ function evaluateDetectionRules(packets, thresholds) {
 
       alerts.push({
         id: `rule2-${source}`,
+        ruleId: 'RULE-2-HOST-SCAN',
         name: 'Possible Network Host Scanning',
         severity: 'MEDIUM',
         source: source,
         destination: `Multiple (${uniqueDests} unique targets)`,
         activity: `Transmitted traffic to ${uniqueDests} unique destination hosts`,
+        evidence: `Communicated with ${uniqueDests} unique destination IP addresses (Threshold: ${thresholds.destinations})`,
         threshold: `Threshold: > ${thresholds.destinations} destinations`,
+        explanation: 'A single host communicating with an unusually large number of destination systems over a brief capture window may indicate network reconnaissance or host discovery.',
         whyMatters: 'A single host communicating with an unusually large number of destination systems over a brief capture window may indicate network reconnaissance or host discovery.',
         benignExplanations: [
           'Enterprise asset discovery, IT inventory, or vulnerability scanning systems',
@@ -523,14 +576,13 @@ function evaluateDetectionRules(packets, thresholds) {
           'Inspect the protocol breakdown: are these ping sweeps (ICMP) or connection probes?',
           'Verify whether the targeted IP addresses belong to valid subnets or are sequential.',
           'Interview the device owner to confirm whether discovery software was intentionally executed.'
-        ]
+        ],
+        wiresharkFilter: isValidIp(source) ? `ip.src == ${source}` : null
       });
     }
   });
 
-  // ------------------------------------------------------------------------
   // RULE 3 — POSSIBLE PORT SCANNING
-  // ------------------------------------------------------------------------
   sourceDestPortsMap.forEach((portsSet, key) => {
     const portCount = portsSet.size;
     if (portCount > thresholds.ports) {
@@ -541,12 +593,15 @@ function evaluateDetectionRules(packets, thresholds) {
 
       alerts.push({
         id: `rule3-${key}`,
+        ruleId: 'RULE-3-PORT-SCAN',
         name: 'Possible Port Scanning',
         severity: 'MEDIUM',
         source: src,
         destination: dst,
         activity: `Contacted ${portCount} unique destination ports on single target`,
+        evidence: `Contacted ${portCount} distinct destination ports on ${dst} (Threshold: ${thresholds.ports})`,
         threshold: `Threshold: > ${thresholds.ports} unique ports`,
+        explanation: 'Systematically probing numerous ports on a single host is a classic hallmark of service discovery or reconnaissance aimed at finding exposed services.',
         whyMatters: 'Systematically probing numerous ports on a single host is a classic hallmark of service discovery or reconnaissance aimed at finding exposed services.',
         benignExplanations: [
           'Authorized security assessment tools (e.g., Nmap, Nessus, OpenVAS)',
@@ -559,14 +614,13 @@ function evaluateDetectionRules(packets, thresholds) {
           'Determine if the connection attempts received replies (SYN-ACK) or resets (RST).',
           'Verify if the scanning host holds an authorized change-management ticket.',
           'Review the target host firewall and security event logs.'
-        ]
+        ],
+        wiresharkFilter: (isValidIp(src) && isValidIp(dst)) ? `ip.src == ${src} && ip.dst == ${dst} && tcp.flags.syn == 1` : null
       });
     }
   });
 
-  // ------------------------------------------------------------------------
   // RULE 4 — HIGH ICMP ACTIVITY
-  // ------------------------------------------------------------------------
   sourceIcmpCounts.forEach((count, source) => {
     if (count > thresholds.icmp) {
       const points = 15;
@@ -575,12 +629,15 @@ function evaluateDetectionRules(packets, thresholds) {
 
       alerts.push({
         id: `rule4-${source}`,
+        ruleId: 'RULE-4-HIGH-ICMP',
         name: 'High ICMP Activity',
         severity: 'LOW',
         source: source,
         destination: 'Various targets',
         activity: `Sent ${count} ICMP control packets`,
+        evidence: `Sent ${count} ICMP packets (Threshold: ${thresholds.icmp})`,
         threshold: `Threshold: > ${thresholds.icmp} ICMP packets`,
+        explanation: 'Unusually high volume of ICMP packets may indicate network ping sweeps, path MTU discovery probes, or automated reachability monitoring.',
         whyMatters: 'Unusually high volume of ICMP packets may indicate network ping sweeps, path MTU discovery probes, or automated reachability monitoring.',
         benignExplanations: [
           'System administrator actively troubleshooting network latency or packet loss',
@@ -592,14 +649,13 @@ function evaluateDetectionRules(packets, thresholds) {
           'Check ICMP types: are they Echo Requests (Type 8), Replies (Type 0), or Destination Unreachable (Type 3)?',
           'Confirm if continuous diagnostic pings were initiated by IT personnel.',
           'Inspect whether the ICMP probes targeted sequential addresses (ping sweep).'
-        ]
+        ],
+        wiresharkFilter: isValidIp(source) ? `ip.src == ${source} && icmp` : null
       });
     }
   });
 
-  // ------------------------------------------------------------------------
   // RULE 5 — HIGH DNS QUERY ACTIVITY
-  // ------------------------------------------------------------------------
   sourceDnsCounts.forEach((count, source) => {
     if (count > thresholds.dns) {
       const points = 15;
@@ -608,12 +664,15 @@ function evaluateDetectionRules(packets, thresholds) {
 
       alerts.push({
         id: `rule5-${source}`,
+        ruleId: 'RULE-5-HIGH-DNS',
         name: 'High DNS Query Volume',
         severity: 'LOW',
         source: source,
         destination: 'DNS Resolvers',
         activity: `Generated ${count} DNS query packets`,
+        evidence: `Sent ${count} DNS query/response packets (Threshold: ${thresholds.dns})`,
         threshold: `Threshold: > ${thresholds.dns} DNS packets`,
+        explanation: 'Spikes in DNS query volume may signify aggressive domain lookups, automated crawlers, misconfigured caching, or potential DNS tunneling/beaconing.',
         whyMatters: 'Spikes in DNS query volume may signify aggressive domain lookups, automated crawlers, misconfigured caching, or potential DNS tunneling/beaconing.',
         benignExplanations: [
           'Web browser loading complex modern websites with dozens of third-party domains',
@@ -625,18 +684,16 @@ function evaluateDetectionRules(packets, thresholds) {
           'Inspect the requested domain names in the Info column for unusually long or random subdomains.',
           'Check whether queries are directed to authorized enterprise DNS resolvers.',
           'Verify if the endpoint runs a high-volume application or web crawler.'
-        ]
+        ],
+        wiresharkFilter: isValidIp(source) ? `ip.src == ${source} && udp.port == 53` : null
       });
     }
   });
 
-  // ------------------------------------------------------------------------
   // RULE 6 — REPEATED SOURCE-TO-DESTINATION COMMUNICATION
-  // ------------------------------------------------------------------------
   conversationCounts.forEach((data, convKey) => {
     if (data.count > thresholds.repeated) {
       const [src, dst] = convKey.split(' -> ');
-      // Get primary protocol
       let topProto = 'TCP';
       let maxPCount = 0;
       data.protocols.forEach((pCount, pName) => {
@@ -652,12 +709,15 @@ function evaluateDetectionRules(packets, thresholds) {
 
       alerts.push({
         id: `rule6-${convKey}`,
+        ruleId: 'RULE-6-REPEATED-TALKER',
         name: 'Repeated Host-to-Host Communication',
         severity: 'INFORMATIONAL',
         source: src,
         destination: dst,
         activity: `${data.count} packets exchanged (${topProto})`,
+        evidence: `Exchanged ${data.count} packets with single destination (Threshold: ${thresholds.repeated})`,
         threshold: `Threshold: > ${thresholds.repeated} conversation packets`,
+        explanation: 'Heavy one-to-one communication patterns indicate an active data channel. Analysts check these to verify whether large transfers or automated beaconing are legitimate.',
         whyMatters: 'Heavy one-to-one communication patterns indicate an active data channel. Analysts check these to verify whether large transfers or automated beaconing are legitimate.',
         benignExplanations: [
           'Active remote desktop session (RDP, SSH, VNC)',
@@ -669,14 +729,13 @@ function evaluateDetectionRules(packets, thresholds) {
           'Identify what application protocol is dominating the session.',
           'Check whether the destination IP belongs to an approved internal server or external CDN.',
           'Correlate the transferred data volume with expected user activity.'
-        ]
+        ],
+        wiresharkFilter: (isValidIp(src) && isValidIp(dst)) ? `ip.src == ${src} && ip.dst == ${dst}` : null
       });
     }
   });
 
-  // ------------------------------------------------------------------------
   // RULE 7 — TCP SYN HEAVY ACTIVITY
-  // ------------------------------------------------------------------------
   sourceSynCounts.forEach((count, source) => {
     if (count > thresholds.syn) {
       const points = 20;
@@ -685,12 +744,15 @@ function evaluateDetectionRules(packets, thresholds) {
 
       alerts.push({
         id: `rule7-${source}`,
+        ruleId: 'RULE-7-SYN-BURST',
         name: 'TCP SYN Heavy Activity',
         severity: 'MEDIUM',
         source: source,
         destination: 'Various targets',
         activity: `Transmitted ${count} TCP SYN connection initiation packets`,
+        evidence: `Transmitted ${count} TCP SYN packets without ACK (Threshold: ${thresholds.syn})`,
         threshold: `Threshold: > ${thresholds.syn} SYN packets`,
+        explanation: 'A cluster of TCP SYN packets indicates repeated attempts to establish new connections. When frequent, it can correlate with port scanning or connection failure cascades.',
         whyMatters: 'A cluster of TCP SYN packets indicates repeated attempts to establish new connections. When frequent, it can correlate with port scanning or connection failure cascades.',
         benignExplanations: [
           'Client application rapidly connecting to multiple web assets or APIs',
@@ -702,7 +764,8 @@ function evaluateDetectionRules(packets, thresholds) {
           'Determine if the target hosts are replying with SYN-ACK or if packets are going unanswered.',
           'Review whether this host is trying to connect to a specific failing server.',
           'Check if the host is executing an automated security scan.'
-        ]
+        ],
+        wiresharkFilter: isValidIp(source) ? `ip.src == ${source} && tcp.flags.syn == 1` : null
       });
     }
   });
@@ -715,14 +778,471 @@ function evaluateDetectionRules(packets, thresholds) {
 }
 
 // ==========================================================================
+// Host Dossier Compiler (100% Client-Side Intelligence)
+// ==========================================================================
+
+function compileHostDossier(targetIp, packets, alerts) {
+  let sentPkts = 0;
+  let recvPkts = 0;
+  let totalBytes = 0;
+
+  const destsMap = new Map();
+  const sourcesMap = new Map();
+  const protocolsMap = new Map();
+
+  for (const pkt of packets) {
+    const isSource = pkt.source === targetIp;
+    const isDest = pkt.destination === targetIp;
+
+    if (isSource) {
+      sentPkts++;
+      totalBytes += pkt.length;
+      destsMap.set(pkt.destination, (destsMap.get(pkt.destination) || 0) + 1);
+      protocolsMap.set(pkt.protocol, (protocolsMap.get(pkt.protocol) || 0) + 1);
+    }
+    if (isDest) {
+      recvPkts++;
+      totalBytes += pkt.length;
+      sourcesMap.set(pkt.source, (sourcesMap.get(pkt.source) || 0) + 1);
+      protocolsMap.set(pkt.protocol, (protocolsMap.get(pkt.protocol) || 0) + 1);
+    }
+  }
+
+  const totalPkts = sentPkts + recvPkts;
+  const avgBytes = totalPkts > 0 ? Math.round(totalBytes / totalPkts) : 0;
+
+  let topProto = 'None';
+  let maxProtoCount = 0;
+  protocolsMap.forEach((count, p) => {
+    if (count > maxProtoCount) {
+      maxProtoCount = count;
+      topProto = p;
+    }
+  });
+
+  const topDests = Array.from(destsMap.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5);
+
+  const topSources = Array.from(sourcesMap.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5);
+
+  // Filter alerts where this IP was source or destination
+  const hostAlerts = alerts.filter(a => a.source === targetIp || a.destination === targetIp);
+
+  return {
+    ip: targetIp,
+    category: classifyIpAddress(targetIp),
+    totalPackets: totalPkts,
+    sentPackets: sentPkts,
+    recvPackets: recvPkts,
+    uniqueDests: destsMap.size,
+    uniqueSources: sourcesMap.size,
+    avgBytes,
+    topProtocol: topProto,
+    topProtoCount: maxProtoCount,
+    protocolsMap,
+    topDests,
+    topSources,
+    hostAlerts
+  };
+}
+
+function openHostDossier(targetIp) {
+  if (!targetIp || !elements.hostDossierModal) return;
+
+  const dossier = compileHostDossier(targetIp, rawPackets, latestRuleResults.alerts);
+
+  elements.dossierIpTitle.textContent = dossier.ip;
+
+  // Category badge
+  const cat = dossier.category;
+  let catClass = 'cat-unknown';
+  if (cat.includes('Private')) catClass = 'cat-private';
+  else if (cat === 'Loopback') catClass = 'cat-loopback';
+  else if (cat === 'Link-local') catClass = 'cat-linklocal';
+  else if (cat === 'Multicast') catClass = 'cat-multicast';
+  else if (cat === 'Broadcast') catClass = 'cat-broadcast';
+  else if (cat === 'Public/WAN') catClass = 'cat-public';
+
+  elements.dossierCategoryBadge.className = `badge badge-category ${catClass}`;
+  elements.dossierCategoryBadge.textContent = cat;
+
+  // Stats
+  elements.dossierTotalPkts.textContent = dossier.totalPackets.toLocaleString();
+  elements.dossierAvgBytes.textContent = `Avg Size: ${dossier.avgBytes} B`;
+  elements.dossierSentPkts.textContent = dossier.sentPackets.toLocaleString();
+  elements.dossierUniqueDests.textContent = `${dossier.uniqueDests} destinations`;
+  elements.dossierRecvPkts.textContent = dossier.recvPackets.toLocaleString();
+  elements.dossierUniqueSources.textContent = `${dossier.uniqueSources} sources`;
+  elements.dossierTopProto.textContent = dossier.topProtocol;
+  elements.dossierProtoCount.textContent = `${dossier.topProtoCount} packets`;
+
+  // Top destinations
+  elements.dossierTopDestsList.innerHTML = '';
+  if (dossier.topDests.length === 0) {
+    elements.dossierTopDestsList.innerHTML = '<span style="font-size:0.75rem; color:var(--text-dim);">No outbound packets recorded</span>';
+  } else {
+    dossier.topDests.forEach(([dest, cnt]) => {
+      const item = document.createElement('div');
+      item.className = 'dossier-list-item';
+      item.innerHTML = `
+        <span class="item-addr">${renderInteractiveIp(dest)}</span>
+        <span class="item-count">${cnt.toLocaleString()} pkts</span>
+      `;
+      elements.dossierTopDestsList.appendChild(item);
+    });
+  }
+
+  // Top sources
+  elements.dossierTopSourcesList.innerHTML = '';
+  if (dossier.topSources.length === 0) {
+    elements.dossierTopSourcesList.innerHTML = '<span style="font-size:0.75rem; color:var(--text-dim);">No inbound packets recorded</span>';
+  } else {
+    dossier.topSources.forEach(([src, cnt]) => {
+      const item = document.createElement('div');
+      item.className = 'dossier-list-item';
+      item.innerHTML = `
+        <span class="item-addr">${renderInteractiveIp(src)}</span>
+        <span class="item-count">${cnt.toLocaleString()} pkts</span>
+      `;
+      elements.dossierTopSourcesList.appendChild(item);
+    });
+  }
+
+  // Protocol bars
+  elements.dossierProtoBars.innerHTML = '';
+  const sortedProtos = Array.from(dossier.protocolsMap.entries()).sort((a, b) => b[1] - a[1]);
+  if (sortedProtos.length === 0) {
+    elements.dossierProtoBars.innerHTML = '<span style="font-size:0.75rem; color:var(--text-dim);">No protocol records</span>';
+  } else {
+    sortedProtos.forEach(([proto, count]) => {
+      const pct = dossier.totalPackets > 0 ? ((count / dossier.totalPackets) * 100).toFixed(1) : 0;
+      const cleanProto = proto.toUpperCase().replace(/[^A-Z]/g, '');
+      const row = document.createElement('div');
+      row.className = 'proto-bar-row';
+      row.innerHTML = `
+        <div class="proto-bar-labels">
+          <span class="proto-bar-name">${escapeHtml(proto)}</span>
+          <span class="proto-bar-stats">${count} pkts (${pct}%)</span>
+        </div>
+        <div class="bar-track">
+          <div class="bar-fill proto-${cleanProto}" style="width: ${pct}%"></div>
+        </div>
+      `;
+      elements.dossierProtoBars.appendChild(row);
+    });
+  }
+
+  // Host alerts
+  elements.dossierAlertsList.innerHTML = '';
+  if (dossier.hostAlerts.length === 0) {
+    elements.dossierAlertsList.innerHTML = '<span style="font-size:0.78rem; color:var(--text-dim);">No triage alerts triggered for this host.</span>';
+  } else {
+    dossier.hostAlerts.forEach(alert => {
+      const row = document.createElement('div');
+      row.className = 'dossier-alert-row';
+      row.innerHTML = `
+        <div>
+          <span class="badge-sev sev-${alert.severity.toLowerCase()}">${alert.severity}</span>
+          <strong class="dossier-alert-name" style="margin-left:6px;">${escapeHtml(alert.name)}</strong>
+          <div class="dossier-alert-evidence">${escapeHtml(alert.evidence)}</div>
+        </div>
+      `;
+      elements.dossierAlertsList.appendChild(row);
+    });
+  }
+
+  elements.hostDossierModal.classList.remove('hidden');
+}
+
+function closeHostDossier() {
+  if (elements.hostDossierModal) {
+    elements.hostDossierModal.classList.add('hidden');
+  }
+}
+
+// ==========================================================================
+// Traffic Density Timeline (Pure Native SVG, Zero Charting Dependencies)
+// ==========================================================================
+
+function parseTimestampsAndRenderTimeline(packets) {
+  const container = elements.timelineContainer;
+  const fallback = elements.timelineFallback;
+  const badge = elements.timelineSpanBadge;
+
+  container.innerHTML = '';
+
+  const parsedTimes = [];
+  for (const pkt of packets) {
+    if (!pkt.time) continue;
+    const trimmed = pkt.time.trim();
+    // Try float seconds
+    const num = parseFloat(trimmed);
+    if (!isNaN(num) && isFinite(num)) {
+      parsedTimes.push(num);
+    } else {
+      // Try date parse
+      const parsedDate = Date.parse(trimmed);
+      if (!isNaN(parsedDate)) {
+        parsedTimes.push(parsedDate / 1000); // convert ms to seconds
+      }
+    }
+  }
+
+  // Require at least 2 parseable timestamps
+  if (parsedTimes.length < 2) {
+    container.classList.add('hidden');
+    fallback.classList.remove('hidden');
+    badge.textContent = 'No Timestamps';
+    return;
+  }
+
+  const minTime = Math.min(...parsedTimes);
+  const maxTime = Math.max(...parsedTimes);
+  const duration = maxTime - minTime;
+
+  // Fallback if timestamps are all identical
+  if (duration <= 0) {
+    container.classList.add('hidden');
+    fallback.classList.remove('hidden');
+    badge.textContent = 'Instantaneous';
+    return;
+  }
+
+  container.classList.remove('hidden');
+  fallback.classList.add('hidden');
+
+  const formattedSpan = duration >= 60 ? `${(duration / 60).toFixed(1)} mins` : `${duration.toFixed(3)}s`;
+  badge.textContent = `Span: ${formattedSpan} (${minTime.toFixed(3)}s to ${maxTime.toFixed(3)}s)`;
+
+  // Divide into buckets (16 buckets)
+  const numBuckets = 16;
+  const bucketCounts = new Array(numBuckets).fill(0);
+  const bucketDuration = duration / numBuckets;
+
+  for (const t of parsedTimes) {
+    const idx = Math.min(numBuckets - 1, Math.floor((t - minTime) / bucketDuration));
+    bucketCounts[idx]++;
+  }
+
+  const maxBucketCount = Math.max(...bucketCounts, 1);
+
+  // SVG parameters
+  const svgWidth = 760;
+  const svgHeight = 110;
+  const padLeft = 45;
+  const padRight = 20;
+  const padBottom = 26;
+  const padTop = 15;
+  const chartWidth = svgWidth - padLeft - padRight;
+  const chartHeight = svgHeight - padTop - padBottom;
+  const barSpacing = 4;
+  const totalSpacing = (numBuckets - 1) * barSpacing;
+  const barWidth = Math.max(2, (chartWidth - totalSpacing) / numBuckets);
+
+  let barsSvg = '';
+  for (let i = 0; i < numBuckets; i++) {
+    const count = bucketCounts[i];
+    const barHeight = Math.max(3, Math.round((count / maxBucketCount) * chartHeight));
+    const x = padLeft + i * (barWidth + barSpacing);
+    const y = padTop + chartHeight - barHeight;
+    const bStart = (minTime + i * bucketDuration).toFixed(3);
+    const bEnd = (minTime + (i + 1) * bucketDuration).toFixed(3);
+
+    barsSvg += `
+      <g>
+        <rect x="${x}" y="${y}" width="${barWidth}" height="${barHeight}" rx="2" fill="#3b82f6" opacity="0.85">
+          <title>Time: ${bStart}s - ${bEnd}s | Packets: ${count}</title>
+        </rect>
+        <rect x="${x}" y="${y}" width="${barWidth}" height="${barHeight}" rx="2" fill="none" stroke="#60a5fa" stroke-width="0.75" />
+      </g>
+    `;
+  }
+
+  const svgMarkup = `
+    <svg viewBox="0 0 ${svgWidth} ${svgHeight}" width="100%" height="110" preserveAspectRatio="none" style="display:block;">
+      <!-- Baseline axis -->
+      <line x1="${padLeft}" y1="${padTop + chartHeight}" x2="${padLeft + chartWidth}" y2="${padTop + chartHeight}" stroke="#233044" stroke-width="1.5" />
+
+      <!-- Peak indicator line & label -->
+      <line x1="${padLeft}" y1="${padTop}" x2="${padLeft + chartWidth}" y2="${padTop}" stroke="#1e293b" stroke-dasharray="3,3" stroke-width="1" />
+      <text x="${padLeft - 6}" y="${padTop + 4}" fill="#64748b" font-size="10" font-family="ui-monospace, monospace" text-anchor="end">${maxBucketCount} pkts</text>
+      <text x="${padLeft - 6}" y="${padTop + chartHeight + 2}" fill="#64748b" font-size="10" font-family="ui-monospace, monospace" text-anchor="end">0</text>
+
+      <!-- Bars -->
+      ${barsSvg}
+
+      <!-- Start and End axis labels -->
+      <text x="${padLeft}" y="${svgHeight - 6}" fill="#94a3b8" font-size="10" font-family="ui-monospace, monospace">Start: ${minTime.toFixed(3)}s</text>
+      <text x="${padLeft + chartWidth}" y="${svgHeight - 6}" fill="#94a3b8" font-size="10" font-family="ui-monospace, monospace" text-anchor="end">End: ${maxTime.toFixed(3)}s</text>
+    </svg>
+  `;
+
+  container.innerHTML = svgMarkup;
+}
+
+// ==========================================================================
+// Export SOC Triage Incident Report (Browser-Generated Markdown)
+// ==========================================================================
+
+function generateTriageMarkdownReport(captureInfo, packets, ruleResults, thresholds) {
+  const activeThresholds = thresholds || currentThresholds || DEFAULT_THRESHOLDS;
+  const dateStr = new Date().toISOString().replace('T', ' ').substring(0, 19) + ' UTC';
+  const isDemo = captureInfo.isDemo ? 'Demo Simulated Capture' : 'Live Capture Ingestion';
+  const fileName = captureInfo.fileName || 'capture.csv';
+
+  // Protocols summary
+  const protoMap = new Map();
+  for (const p of packets) {
+    protoMap.set(p.protocol, (protoMap.get(p.protocol) || 0) + 1);
+  }
+  const protoList = Array.from(protoMap.entries())
+    .sort((a, b) => b[1] - a[1])
+    .map(([proto, count]) => `- **${proto}**: ${count} packets (${((count / packets.length) * 100).toFixed(1)}%)`)
+    .join('\n');
+
+  // Classification label
+  let classification = 'Baseline Traffic (Routine)';
+  if (ruleResults.score >= 60) classification = 'Notable Priority (Requires Review)';
+  else if (ruleResults.score >= 30) classification = 'Elevated Activity (Routine Triage)';
+
+  // Alerts section
+  let findingsSection = '';
+  if (ruleResults.alerts.length === 0) {
+    findingsSection = `### Zero Anomalous Alerts Triggered\n\nAll packet counts and communication patterns are currently within configured baseline thresholds. No investigative findings were generated under the current rule configuration.\n`;
+  } else {
+    findingsSection = ruleResults.alerts.map((alert, index) => {
+      const benignItems = alert.benignExplanations.map(b => `  - ${b}`).join('\n');
+      const stepsItems = alert.suggestedInvestigation.map(s => `  1. ${s}`).join('\n');
+      const filterLine = alert.wiresharkFilter
+        ? `\n- **Suggested Wireshark Filter:** \`${alert.wiresharkFilter}\``
+        : `\n- **Suggested Wireshark Filter:** *Unavailable (required packet fields missing in CSV)*`;
+
+      return `#### Finding ${index + 1}: ${alert.name} [${alert.severity}]
+- **Rule Identifier:** \`${alert.ruleId}\`
+- **Source Host:** \`${alert.source}\`
+- **Destination Host:** \`${alert.destination || 'Various'}\`
+- **Observed Evidence:** ${alert.evidence}
+- **Configured Threshold:** ${alert.threshold}${filterLine}
+
+**Why This Activity Deserves Investigation:**  
+${alert.whyMatters}
+
+**Possible Benign Explanations:**  
+${benignItems}
+
+**Recommended SOC Investigation Steps:**  
+${stepsItems}
+`;
+    }).join('\n---\n\n');
+  }
+
+  return `# Security Operations Center (SOC) Triage Report
+**Network Traffic Anomaly & Investigation Triage Assessment**
+
+---
+
+## 1. Executive Summary
+
+| Parameter | Value |
+| :--- | :--- |
+| **Report Generated** | ${dateStr} |
+| **Ingested Capture File** | \`${fileName}\` |
+| **Data Classification** | ${isDemo} |
+| **Total Packets Ingested** | ${packets.length.toLocaleString()} |
+| **Unique Source Hosts** | ${new Set(packets.map(p => p.source)).size} |
+| **Unique Destination Hosts** | ${new Set(packets.map(p => p.destination)).size} |
+| **Investigation Triage Score** | **${ruleResults.score} / 100** |
+| **Triage Classification** | **${classification}** |
+
+> [!IMPORTANT]
+> **Mandatory Analyst Disclaimer:**  
+> Alerts indicate activity worth investigating and do not prove malicious behaviour.  
+> Only analyse traffic from systems and networks you own or are authorised to monitor.
+
+---
+
+## 2. Ingested Protocol Distribution
+
+${protoList}
+
+---
+
+## 3. Active Rule Thresholds Configured
+
+- **Rule 1 (Packets per Source):** > ${activeThresholds.volume} packets
+- **Rule 2 (Unique Destinations / Host Scan):** > ${activeThresholds.destinations} targets
+- **Rule 3 (Unique Ports / Port Scan):** > ${activeThresholds.ports} destination ports
+- **Rule 4 (ICMP Packets per Source):** > ${activeThresholds.icmp} packets
+- **Rule 5 (DNS Queries per Source):** > ${activeThresholds.dns} packets
+- **Rule 6 (Repeated Source-to-Destination):** > ${activeThresholds.repeated} conversation packets
+- **Rule 7 (Heavy TCP SYN initiation):** > ${activeThresholds.syn} SYN packets
+
+---
+
+## 4. Triage Findings & Evidence
+
+${findingsSection}
+
+---
+
+## 5. Recommended Tier-2 Next Actions
+
+1. **Verify Source Attribution:** Cross-reference flagged source IPs against enterprise DHCP leases, asset management databases, and Active Directory computer accounts.
+2. **Review Host Context:** Check whether flagged endpoints are running scheduled backups, administrative inventory scanners, or developer test scripts.
+3. **Inspect Full Payload:** If anomalies remain unexplained, obtain the full raw \`.pcap\` capture to inspect deep payload bytes, certificates, and application-layer protocols.
+4. **Correlate Telemetry:** Check endpoint EDR (CrowdStrike/Defender/Sysmon) process execution logs matching the capture timeframe.
+
+---
+*Generated client-side by Network Traffic Triage Tool (net-triage) &bull; Zero external data transmission.*
+`;
+}
+
+function exportTriageReport() {
+  if (rawPackets.length === 0) return;
+
+  const captureInfo = {
+    fileName: currentFileName || 'capture.csv',
+    isDemo: isDemoData
+  };
+
+  const markdownContent = generateTriageMarkdownReport(
+    captureInfo,
+    rawPackets,
+    latestRuleResults,
+    currentThresholds
+  );
+
+  const cleanName = (currentFileName || 'capture').replace(/[^a-zA-Z0-9_-]/g, '_');
+  const downloadFileName = `triage-report-${cleanName}-${Date.now()}.md`;
+
+  const blob = new Blob([markdownContent], { type: 'text/markdown;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = downloadFileName;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+// ==========================================================================
 // Dashboard Analysis, Aggregation & Rendering
 // ==========================================================================
+
+function renderInteractiveIp(ip) {
+  if (!ip) return 'Unknown';
+  return `<button type="button" class="ip-interactive" data-ip="${escapeHtml(ip)}" title="Click to view Host Dossier for ${escapeHtml(ip)}">${escapeHtml(ip)}</button>`;
+}
 
 function runAnalysisAndRender() {
   if (rawPackets.length === 0) return;
 
   // 1. Detection Rules Evaluation
-  const ruleResults = evaluateDetectionRules(rawPackets, currentThresholds);
+  latestRuleResults = evaluateDetectionRules(rawPackets, currentThresholds);
 
   // 2. Metrics Aggregations
   let totalBytes = 0;
@@ -733,17 +1253,10 @@ function runAnalysisAndRender() {
 
   for (const pkt of rawPackets) {
     totalBytes += pkt.length;
-
-    // Sources
     sourcesMap.set(pkt.source, (sourcesMap.get(pkt.source) || 0) + 1);
-
-    // Destinations
     destsMap.set(pkt.destination, (destsMap.get(pkt.destination) || 0) + 1);
-
-    // Protocols
     protocolsMap.set(pkt.protocol, (protocolsMap.get(pkt.protocol) || 0) + 1);
 
-    // Conversations
     const convKey = `${pkt.source} -> ${pkt.destination}`;
     if (!conversationsMap.has(convKey)) {
       conversationsMap.set(convKey, {
@@ -758,7 +1271,6 @@ function runAnalysisAndRender() {
     conv.protocols.set(pkt.protocol, (conv.protocols.get(pkt.protocol) || 0) + 1);
   }
 
-  // Find Top Source
   let topSource = 'None';
   let maxSourceCount = 0;
   sourcesMap.forEach((count, src) => {
@@ -768,7 +1280,6 @@ function runAnalysisAndRender() {
     }
   });
 
-  // Find Top Dest
   let topDest = 'None';
   let maxDestCount = 0;
   destsMap.forEach((count, dst) => {
@@ -778,7 +1289,6 @@ function runAnalysisAndRender() {
     }
   });
 
-  // Find Top Protocol
   let topProtocol = 'None';
   let maxProtoCount = 0;
   protocolsMap.forEach((count, proto) => {
@@ -795,19 +1305,22 @@ function runAnalysisAndRender() {
   elements.statAvgLength.textContent = `Avg Length: ${avgLength} Bytes`;
 
   elements.statUniqueSources.textContent = sourcesMap.size.toLocaleString();
-  elements.statTopSource.textContent = `Top: ${topSource} (${maxSourceCount} pkts)`;
+  elements.statTopSource.innerHTML = `Top: ${renderInteractiveIp(topSource)} (${maxSourceCount} pkts)`;
 
   elements.statUniqueDests.textContent = destsMap.size.toLocaleString();
-  elements.statTopDest.textContent = `Top: ${topDest} (${maxDestCount} pkts)`;
+  elements.statTopDest.innerHTML = `Top: ${renderInteractiveIp(topDest)} (${maxDestCount} pkts)`;
 
   elements.statTopProtocol.textContent = topProtocol;
   elements.statProtocolCount.textContent = `${maxProtoCount.toLocaleString()} packets (${Math.round((maxProtoCount / rawPackets.length) * 100)}%)`;
 
   // Render Investigation Score
-  renderInvestigationScore(ruleResults.score, ruleResults.breakdown);
+  renderInvestigationScore(latestRuleResults.score, latestRuleResults.breakdown);
+
+  // Render Traffic Timeline
+  parseTimestampsAndRenderTimeline(rawPackets);
 
   // Render Alerts
-  renderAlerts(ruleResults.alerts);
+  renderAlerts(latestRuleResults.alerts);
 
   // Render Visual Protocol Bars
   renderProtocolBars(protocolsMap, rawPackets.length);
@@ -821,13 +1334,10 @@ function runAnalysisAndRender() {
   // Render Top Conversations Table
   renderTopConversations(conversationsMap);
 
-  // Render Packet Preview Table (with active filters)
+  // Render Packet Preview Table
   renderFilteredPacketPreview();
 }
 
-/**
- * Render Investigation Score and transparent penalty breakdown.
- */
 function renderInvestigationScore(score, breakdown) {
   elements.statInvestScore.textContent = score;
 
@@ -856,9 +1366,6 @@ function renderInvestigationScore(score, breakdown) {
   }
 }
 
-/**
- * Render Triage Alert Cards with full analyst context.
- */
 function renderAlerts(alerts) {
   const container = elements.alertsContainer;
   container.innerHTML = '';
@@ -888,6 +1395,39 @@ function renderAlerts(alerts) {
     const benignListHtml = alert.benignExplanations.map(item => `<li>${escapeHtml(item)}</li>`).join('');
     const stepsListHtml = alert.suggestedInvestigation.map(step => `<li>${escapeHtml(step)}</li>`).join('');
 
+    // Wireshark display filter section
+    let filterBlockHtml = '';
+    if (alert.wiresharkFilter) {
+      filterBlockHtml = `
+        <div class="wireshark-filter-box">
+          <div class="filter-header-row">
+            <span class="filter-header-label">Investigative Wireshark Display Filter</span>
+            <span class="filter-notice-text">Generated from the evidence available in this CSV.</span>
+          </div>
+          <div class="wireshark-code-row">
+            <code class="filter-code-text">${escapeHtml(alert.wiresharkFilter)}</code>
+            <button type="button" class="btn-copy-filter" data-filter="${escapeHtml(alert.wiresharkFilter)}">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+              </svg>
+              <span>Copy Filter</span>
+            </button>
+          </div>
+        </div>
+      `;
+    } else {
+      filterBlockHtml = `
+        <div class="wireshark-filter-box">
+          <span class="filter-unavailable-notice">Wireshark filter unavailable because the required packet fields were not present in this CSV.</span>
+        </div>
+      `;
+    }
+
+    const destDisplay = alert.destination
+      ? (isValidIp(alert.destination) ? renderInteractiveIp(alert.destination) : escapeHtml(alert.destination))
+      : 'Various';
+
     card.innerHTML = `
       <div class="alert-top">
         <div class="alert-title-row">
@@ -895,20 +1435,22 @@ function renderAlerts(alerts) {
           <h3 class="alert-name">${escapeHtml(alert.name)}</h3>
         </div>
         <div class="alert-hosts-meta">
-          Source: <span>${escapeHtml(alert.source)}</span> | Destination: <span>${escapeHtml(alert.destination)}</span>
+          Source: ${renderInteractiveIp(alert.source)} | Destination: ${destDisplay}
         </div>
       </div>
 
       <div class="alert-evidence-grid">
         <div class="evidence-item">
-          <strong>Observed Activity</strong>
-          <span>${escapeHtml(alert.activity)}</span>
+          <strong>Observed Evidence</strong>
+          <span>${escapeHtml(alert.evidence)}</span>
         </div>
         <div class="evidence-item">
           <strong>Configured Rule Parameter</strong>
           <span>${escapeHtml(alert.threshold)}</span>
         </div>
       </div>
+
+      ${filterBlockHtml}
 
       <div class="alert-sections-grid">
         <div class="alert-block">
@@ -918,7 +1460,7 @@ function renderAlerts(alerts) {
               <line x1="12" y1="16" x2="12" y2="12"></line>
               <line x1="12" y1="8" x2="12.01" y2="8"></line>
             </svg>
-            Why This Matters
+            Why This Activity Could Matter
           </h4>
           <p>${escapeHtml(alert.whyMatters)}</p>
         </div>
@@ -944,9 +1486,6 @@ function renderAlerts(alerts) {
   });
 }
 
-/**
- * Render visual CSS bars for Protocol Distribution.
- */
 function renderProtocolBars(protocolsMap, totalPackets) {
   const container = elements.protocolBarsContainer;
   container.innerHTML = '';
@@ -955,11 +1494,8 @@ function renderProtocolBars(protocolsMap, totalPackets) {
 
   sorted.forEach(([proto, count]) => {
     const pct = totalPackets > 0 ? ((count / totalPackets) * 100).toFixed(1) : 0;
-
     const row = document.createElement('div');
     row.className = 'proto-bar-row';
-
-    // Normalize proto name for css accent styling
     const cleanProto = proto.toUpperCase().replace(/[^A-Z]/g, '');
 
     row.innerHTML = `
@@ -976,9 +1512,6 @@ function renderProtocolBars(protocolsMap, totalPackets) {
   });
 }
 
-/**
- * Render Top 10 Source Hosts table.
- */
 function renderTopSources(sourcesMap, totalPackets) {
   const tbody = elements.topSourcesBody;
   tbody.innerHTML = '';
@@ -992,7 +1525,7 @@ function renderTopSources(sourcesMap, totalPackets) {
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td class="cell-rank">#${index + 1}</td>
-      <td class="cell-mono">${escapeHtml(src)}</td>
+      <td class="cell-mono">${renderInteractiveIp(src)}</td>
       <td>${count.toLocaleString()}</td>
       <td>${pct}%</td>
     `;
@@ -1000,9 +1533,6 @@ function renderTopSources(sourcesMap, totalPackets) {
   });
 }
 
-/**
- * Render Top 10 Destination Hosts table.
- */
 function renderTopDestinations(destsMap, totalPackets) {
   const tbody = elements.topDestsBody;
   tbody.innerHTML = '';
@@ -1016,7 +1546,7 @@ function renderTopDestinations(destsMap, totalPackets) {
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td class="cell-rank">#${index + 1}</td>
-      <td class="cell-mono">${escapeHtml(dst)}</td>
+      <td class="cell-mono">${renderInteractiveIp(dst)}</td>
       <td>${count.toLocaleString()}</td>
       <td>${pct}%</td>
     `;
@@ -1024,9 +1554,6 @@ function renderTopDestinations(destsMap, totalPackets) {
   });
 }
 
-/**
- * Render Top Host Conversations table.
- */
 function renderTopConversations(conversationsMap) {
   const tbody = elements.topConvsBody;
   tbody.innerHTML = '';
@@ -1047,8 +1574,8 @@ function renderTopConversations(conversationsMap) {
 
     const tr = document.createElement('tr');
     tr.innerHTML = `
-      <td class="cell-mono">${escapeHtml(conv.source)}</td>
-      <td class="cell-mono">${escapeHtml(conv.destination)}</td>
+      <td class="cell-mono">${renderInteractiveIp(conv.source)}</td>
+      <td class="cell-mono">${renderInteractiveIp(conv.destination)}</td>
       <td>${conv.count.toLocaleString()}</td>
       <td><span class="badge badge-subtle">${escapeHtml(topProto)}</span></td>
     `;
@@ -1056,9 +1583,6 @@ function renderTopConversations(conversationsMap) {
   });
 }
 
-/**
- * Dynamically populate protocol filter dropdown with active protocols.
- */
 function populateProtocolFilterDropdown() {
   const select = elements.protocolFilter;
   select.innerHTML = '<option value="ALL">All Protocols</option>';
@@ -1074,9 +1598,6 @@ function populateProtocolFilterDropdown() {
   });
 }
 
-/**
- * Render Filtered Raw Packet Log Preview table.
- */
 function renderFilteredPacketPreview() {
   const tbody = elements.packetListBody;
   tbody.innerHTML = '';
@@ -1111,8 +1632,8 @@ function renderFilteredPacketPreview() {
     tr.innerHTML = `
       <td class="cell-rank">${escapeHtml(pkt.no)}</td>
       <td class="cell-mono" style="font-size:0.75rem;">${escapeHtml(pkt.time)}</td>
-      <td class="cell-mono">${escapeHtml(pkt.source)}</td>
-      <td class="cell-mono">${escapeHtml(pkt.destination)}</td>
+      <td class="cell-mono">${renderInteractiveIp(pkt.source)}</td>
+      <td class="cell-mono">${renderInteractiveIp(pkt.destination)}</td>
       <td><span class="badge badge-subtle">${escapeHtml(pkt.protocol)}</span></td>
       <td>${pkt.length}</td>
       <td style="max-width:320px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${escapeHtml(pkt.info)}">
@@ -1183,7 +1704,12 @@ function setupEventListeners() {
     ingestCsvContent(DEMO_SAMPLES.mixedLab, 'mixed-soc-lab.csv', true);
   });
 
-  // 3. Threshold Configuration Accordion
+  // 3. Export Triage Report Button
+  elements.exportReportBtn.addEventListener('click', () => {
+    exportTriageReport();
+  });
+
+  // 4. Threshold Configuration Accordion
   elements.configToggle.addEventListener('click', () => {
     const isExpanded = elements.configToggle.getAttribute('aria-expanded') === 'true';
     elements.configToggle.setAttribute('aria-expanded', !isExpanded);
@@ -1197,7 +1723,6 @@ function setupEventListeners() {
     }
   });
 
-  // Apply Thresholds
   elements.applyThresholdsBtn.addEventListener('click', () => {
     currentThresholds.volume = parseInt(elements.threshVolume.value, 10) || DEFAULT_THRESHOLDS.volume;
     currentThresholds.destinations = parseInt(elements.threshDestinations.value, 10) || DEFAULT_THRESHOLDS.destinations;
@@ -1210,7 +1735,6 @@ function setupEventListeners() {
     runAnalysisAndRender();
   });
 
-  // Reset Defaults
   elements.resetDefaultsBtn.addEventListener('click', () => {
     currentThresholds = { ...DEFAULT_THRESHOLDS };
     elements.threshVolume.value = DEFAULT_THRESHOLDS.volume;
@@ -1224,14 +1748,13 @@ function setupEventListeners() {
     runAnalysisAndRender();
   });
 
-  // 4. Severity Alert Filter
+  // 5. Severity Alert Filter
   elements.severityFilter.addEventListener('change', (e) => {
     activeFilter.severity = e.target.value;
-    const ruleResults = evaluateDetectionRules(rawPackets, currentThresholds);
-    renderAlerts(ruleResults.alerts);
+    renderAlerts(latestRuleResults.alerts);
   });
 
-  // 5. Interactive Table & Search Filters
+  // 6. Interactive Table & Search Filters
   elements.searchInput.addEventListener('input', (e) => {
     activeFilter.search = e.target.value.trim();
     renderFilteredPacketPreview();
@@ -1250,7 +1773,46 @@ function setupEventListeners() {
     renderFilteredPacketPreview();
   });
 
-  // 6. Educational Analyst Guide Modal
+  // 7. Interactive IP Click Listener (Event Delegation across entire document)
+  document.addEventListener('click', (e) => {
+    const ipBtn = e.target.closest('.ip-interactive');
+    if (ipBtn) {
+      const ip = ipBtn.getAttribute('data-ip');
+      if (ip) {
+        openHostDossier(ip);
+      }
+      return;
+    }
+
+    // Wireshark Filter Copy Button Delegation
+    const copyBtn = e.target.closest('.btn-copy-filter');
+    if (copyBtn) {
+      const filterText = copyBtn.getAttribute('data-filter');
+      if (filterText) {
+        copyWiresharkFilter(filterText, copyBtn);
+      }
+    }
+  });
+
+  // Keyboard Enter on interactive IP
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      const ipBtn = document.activeElement && document.activeElement.closest('.ip-interactive');
+      if (ipBtn) {
+        const ip = ipBtn.getAttribute('data-ip');
+        if (ip) openHostDossier(ip);
+      }
+    }
+  });
+
+  // 8. Host Dossier Modal Close Listeners
+  elements.closeDossierBtn.addEventListener('click', closeHostDossier);
+  elements.closeDossierBottomBtn.addEventListener('click', closeHostDossier);
+  elements.hostDossierModal.addEventListener('click', (e) => {
+    if (e.target === elements.hostDossierModal) closeHostDossier();
+  });
+
+  // 9. Educational Analyst Guide Modal
   const openGuide = () => {
     elements.analystGuideModal.classList.remove('hidden');
     elements.toggleGuideBtn.setAttribute('aria-expanded', 'true');
@@ -1270,15 +1832,70 @@ function setupEventListeners() {
   });
 
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && !elements.analystGuideModal.classList.contains('hidden')) {
-      closeGuide();
+    if (e.key === 'Escape') {
+      if (!elements.hostDossierModal.classList.contains('hidden')) {
+        closeHostDossier();
+      } else if (!elements.analystGuideModal.classList.contains('hidden')) {
+        closeGuide();
+      }
     }
   });
 }
 
 /**
- * Handle user file selection safely via FileReader API.
+ * Copies a Wireshark filter string to the clipboard with clear UI feedback.
  */
+function copyWiresharkFilter(filterString, buttonElement) {
+  if (!filterString) return;
+
+  const performFeedback = () => {
+    const originalHtml = buttonElement.innerHTML;
+    buttonElement.classList.add('copied');
+    buttonElement.innerHTML = `
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true">
+        <polyline points="20 6 9 17 4 12"></polyline>
+      </svg>
+      <span>Filter copied.</span>
+    `;
+
+    setTimeout(() => {
+      buttonElement.classList.remove('copied');
+      buttonElement.innerHTML = originalHtml;
+    }, 2000);
+  };
+
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(filterString).then(performFeedback).catch(() => {
+      fallbackCopyText(filterString);
+      performFeedback();
+    });
+  } else {
+    fallbackCopyText(filterString);
+    performFeedback();
+  }
+}
+
+/**
+ * Compatibility fallback for copy text in constrained local browser contexts.
+ */
+function fallbackCopyText(text) {
+  const textarea = document.createElement('textarea');
+  textarea.value = text;
+  textarea.style.position = 'fixed';
+  textarea.style.top = '0';
+  textarea.style.left = '0';
+  textarea.style.opacity = '0';
+  document.body.appendChild(textarea);
+  textarea.focus();
+  textarea.select();
+  try {
+    document.execCommand('copy');
+  } catch (err) {
+    // Ignore copy error
+  }
+  document.body.removeChild(textarea);
+}
+
 function handleFileSelection(file) {
   if (!file) return;
 
@@ -1303,9 +1920,6 @@ function handleFileSelection(file) {
   reader.readAsText(file);
 }
 
-/**
- * Helper to prevent DOM-based XSS injection.
- */
 function escapeHtml(str) {
   if (str === null || str === undefined) return '';
   return String(str)
